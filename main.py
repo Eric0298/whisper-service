@@ -3,56 +3,95 @@ from faster_whisper import WhisperModel
 import tempfile
 import os
 
-app = FastAPI()
+app = FastAPI(title="whisper-service", version="0.1.0")
 
-# CPU mode (gratis). Si algún día tienes GPU, se puede cambiar.
-model = WhisperModel("base", device="cpu", compute_type="int8")
-
+# === CONFIG ===
+MAX_BYTES = 25 * 1024 * 1024  # 25MB
 ALLOWED_MIME = {
-    "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
-    "audio/webm", "audio/ogg", "audio/mp4", "audio/x-m4a", "audio/aac"
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/ogg",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/aac",
 }
 
-@app.post("/transcribe")
-async def transcribe(
+# CPU mode (gratis)
+model = WhisperModel("base", device="cpu", compute_type="int8")
+
+
+# === HEALTHCHECKS ===
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "whisper-service"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "status": "healthy"}
+
+
+# === TRANSCRIPTION ===
+
+@app.post("/transcribe/file")
+async def transcribe_file(
     file: UploadFile = File(...),
     language: str = Form("es"),
-    context: str = Form("")
+    context: str = Form(""),
 ):
-    if file.content_type and file.content_type not in ALLOWED_MIME:
-        raise HTTPException(status_code=415, detail=f"Tipo no permitido: {file.content_type}")
+    if not file:
+        raise HTTPException(status_code=400, detail="Falta archivo")
 
-    # Guardar temporalmente el archivo
+    if file.content_type and file.content_type not in ALLOWED_MIME:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Tipo no permitido: {file.content_type}",
+        )
+
+    content = await file.read()
+
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Archivo vacío")
+
+    if len(content) > MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Archivo demasiado grande (máx 25MB)",
+        )
+
     suffix = os.path.splitext(file.filename or "")[1] or ".audio"
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        # Whisper (faster-whisper) soporta "language" opcional
         segments, info = model.transcribe(
             tmp_path,
-            language=language if language else None
+            language=language if language else None,
         )
 
-        text_parts = []
-        for seg in segments:
-            text_parts.append(seg.text)
+        text = "".join(seg.text for seg in segments).strip()
 
-        text = "".join(text_parts).strip()
         duration = float(getattr(info, "duration", 0) or 0)
 
-        # "context" aquí todavía no se usa (whisper base no lo aprovecha como prompt real),
-        # pero lo mantenemos por compatibilidad y para futuros proveedores.
         return {
             "ok": True,
             "text": text if text else "(sin texto)",
-            "durationSec": duration,
+            "durationSec": round(duration),
             "language": language,
+            "type": "file",
         }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         try:
             os.remove(tmp_path)
-        except:
+        except Exception:
             pass
