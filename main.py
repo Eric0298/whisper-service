@@ -6,14 +6,33 @@ import shutil
 
 app = FastAPI(title="whisper-service", version="0.1.0")
 
-MAX_BYTES = 25 * 1024 * 1024
-
+MAX_BYTES = 25 * 1024 * 1024  # 25MB
 ALLOWED_MIME = {
-    "audio/mpeg","audio/mp3","audio/wav","audio/x-wav","audio/webm","audio/ogg",
-    "audio/mp4","audio/x-m4a","audio/aac",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/ogg",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/aac",
 }
 
+# ✅ IMPORTANTE: si sigues justo de RAM en Railway, cambia "base" -> "tiny"
+# model = WhisperModel("tiny", device="cpu", compute_type="int8")
 model = WhisperModel("base", device="cpu", compute_type="int8")
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "whisper-service"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "status": "healthy"}
+
 
 @app.post("/transcribe/file")
 async def transcribe_file(
@@ -27,28 +46,29 @@ async def transcribe_file(
     if file.content_type and file.content_type not in ALLOWED_MIME:
         raise HTTPException(status_code=415, detail=f"Tipo no permitido: {file.content_type}")
 
+    # Validación por tamaño si viene en headers (no siempre viene)
+    # En FastAPI/UploadFile no tienes content-length fiable del archivo, así que limitamos
+    # por lectura controlada en copia.
+
     suffix = os.path.splitext(file.filename or "")[1] or ".audio"
 
-    # ✅ Guardar a disco en streaming y contar tamaño sin reventar RAM
-    size = 0
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        while True:
-            chunk = await file.read(1024 * 1024)  # 1MB
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_BYTES:
-                tmp.close()
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-                raise HTTPException(status_code=413, detail="Archivo demasiado grande (máx 25MB)")
-            tmp.write(chunk)
-
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+
+            # Copia streaming sin cargar todo a RAM + control de tamaño
+            total = 0
+            chunk_size = 1024 * 1024  # 1MB
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Archivo demasiado grande (máx 25MB)")
+                tmp.write(chunk)
+
         segments, info = model.transcribe(
             tmp_path,
             language=language if language else None,
@@ -65,11 +85,13 @@ async def transcribe_file(
             "type": "file",
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     finally:
         try:
-            os.remove(tmp_path)
+            if tmp_path:
+                os.remove(tmp_path)
         except Exception:
             pass
