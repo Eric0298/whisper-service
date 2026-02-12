@@ -20,8 +20,8 @@ ALLOWED_MIME = {
 }
 
 # ✅ IMPORTANTE: si sigues justo de RAM en Railway, cambia "base" -> "tiny"
-# model = WhisperModel("tiny", device="cpu", compute_type="int8")
-model = WhisperModel("base", device="cpu", compute_type="int8")
+model = WhisperModel("tiny", device="cpu", compute_type="int8")
+# model = WhisperModel("base", device="cpu", compute_type="int8")
 
 
 @app.get("/", include_in_schema=False)
