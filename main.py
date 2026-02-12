@@ -5,7 +5,6 @@ import os
 
 app = FastAPI(title="whisper-service", version="0.1.0")
 
-# === CONFIG ===
 MAX_BYTES = 25 * 1024 * 1024  # 25MB
 ALLOWED_MIME = {
     "audio/mpeg",
@@ -19,23 +18,28 @@ ALLOWED_MIME = {
     "audio/aac",
 }
 
-# CPU mode (gratis)
-model = WhisperModel("base", device="cpu", compute_type="int8")
+# ✅ Config por entorno (Railway)
+MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")          # tiny | base | small...
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")      # int8 recomendado CPU
+CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))      # baja picos
+NUM_WORKERS = int(os.getenv("WHISPER_WORKERS", "1"))          # 1 para no duplicar RAM
 
-
-# === HEALTHCHECKS ===
+# ✅ Modelo global (se carga 1 vez)
+model = WhisperModel(
+    MODEL_SIZE,
+    device="cpu",
+    compute_type=COMPUTE_TYPE,
+    cpu_threads=CPU_THREADS,
+    num_workers=NUM_WORKERS,
+)
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"ok": True, "service": "whisper-service"}
-
+    return {"ok": True, "service": "whisper-service", "model": MODEL_SIZE}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "status": "healthy"}
-
-
-# === TRANSCRIPTION ===
+    return {"ok": True, "status": "healthy", "model": MODEL_SIZE}
 
 @app.post("/transcribe/file")
 async def transcribe_file(
@@ -47,10 +51,7 @@ async def transcribe_file(
         raise HTTPException(status_code=400, detail="Falta archivo")
 
     if file.content_type and file.content_type not in ALLOWED_MIME:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Tipo no permitido: {file.content_type}",
-        )
+        raise HTTPException(status_code=415, detail=f"Tipo no permitido: {file.content_type}")
 
     content = await file.read()
 
@@ -58,10 +59,7 @@ async def transcribe_file(
         raise HTTPException(status_code=400, detail="Archivo vacío")
 
     if len(content) > MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="Archivo demasiado grande (máx 25MB)",
-        )
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (máx 25MB)")
 
     suffix = os.path.splitext(file.filename or "")[1] or ".audio"
 
@@ -76,7 +74,6 @@ async def transcribe_file(
         )
 
         text = "".join(seg.text for seg in segments).strip()
-
         duration = float(getattr(info, "duration", 0) or 0)
 
         return {
