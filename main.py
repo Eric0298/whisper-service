@@ -18,6 +18,7 @@ ALLOWED_MIME = {
     "audio/aac",
 }
 
+# ✅ IMPORTANTE: si sigues justo de RAM en Railway, cambia "base" -> "tiny"
 model = WhisperModel("tiny", device="cpu", compute_type="int8")
 # model = WhisperModel("base", device="cpu", compute_type="int8")
 
@@ -32,23 +33,40 @@ def health():
     return {"ok": True, "status": "healthy"}
 
 
-def format_paragraphs_from_segments(seg_list, max_paragraph_sec=15.0, pause_sec=1.0):
+def format_paragraphs_from_segments(
+    seg_list,
+    max_paragraph_sec=22.0,
+    pause_sec=0.7,
+    min_words=8
+):
     """
-    Junta segments en párrafos:
-    - corta si el párrafo acumula >= max_paragraph_sec
-    - corta si hay una pausa (gap) >= pause_sec
-    Devuelve string con párrafos separados por doble salto de línea.
+    Junta segments en párrafos con reglas mejoradas:
+    - corta si hay pausa (gap) >= pause_sec
+    - corta si el texto del segmento termina en .?! (final de frase)
+    - corta si el párrafo acumula >= max_paragraph_sec (límite de seguridad)
+    - evita párrafos demasiado cortos (min_words)
     """
     paragraphs = []
     buf = []
     start_t = None
     last_end = None
 
-    def flush():
+    def buf_word_count():
+        return len(" ".join(buf).split())
+
+    def flush(force=False):
         nonlocal buf, start_t
         text = " ".join(" ".join(buf).split()).strip()
-        if text:
-            paragraphs.append(text)
+        if not text:
+            buf = []
+            start_t = None
+            return
+
+        # Si es demasiado corto, no flush salvo que sea el último (force=True)
+        if not force and buf_word_count() < min_words:
+            return
+
+        paragraphs.append(text)
         buf = []
         start_t = None
 
@@ -56,6 +74,7 @@ def format_paragraphs_from_segments(seg_list, max_paragraph_sec=15.0, pause_sec=
         s = float(getattr(seg, "start", 0.0) or 0.0)
         e = float(getattr(seg, "end", 0.0) or 0.0)
         t = (getattr(seg, "text", "") or "").strip()
+
         if not t:
             last_end = e
             continue
@@ -63,20 +82,31 @@ def format_paragraphs_from_segments(seg_list, max_paragraph_sec=15.0, pause_sec=
         if start_t is None:
             start_t = s
 
+        # Regla pausa
         if last_end is not None:
             gap = s - float(last_end)
             if gap >= pause_sec:
-                flush()
-                start_t = s
+                flush()  # solo corta si no es demasiado corto
+                # Si no cortó por ser corto, seguimos acumulando
+                if start_t is None:
+                    start_t = s
 
         buf.append(t)
 
+        # Regla final de frase
+        ends_sentence = t.endswith(".") or t.endswith("?") or t.endswith("!")
+        if ends_sentence:
+            flush()
+
+        # Regla tiempo máximo
         if start_t is not None and (e - start_t) >= max_paragraph_sec:
             flush()
 
         last_end = e
 
-    flush()
+    # Último flush forzado (para no perder el final)
+    flush(force=True)
+
     return "\n\n".join(paragraphs).strip()
 
 
@@ -90,7 +120,10 @@ async def transcribe_file(
         raise HTTPException(status_code=400, detail="Falta archivo")
 
     if file.content_type and file.content_type not in ALLOWED_MIME:
-        raise HTTPException(status_code=415, detail=f"Tipo no permitido: {file.content_type}")
+        raise HTTPException(
+            status_code=415,
+            detail=f"Tipo no permitido: {file.content_type}"
+        )
 
     suffix = os.path.splitext(file.filename or "")[1] or ".audio"
 
@@ -99,6 +132,7 @@ async def transcribe_file(
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
 
+            # Copia streaming sin cargar todo a RAM + control de tamaño
             total = 0
             chunk_size = 1024 * 1024  # 1MB
             while True:
@@ -107,7 +141,10 @@ async def transcribe_file(
                     break
                 total += len(chunk)
                 if total > MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="Archivo demasiado grande (máx 25MB)")
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Archivo demasiado grande (máx 25MB)"
+                    )
                 tmp.write(chunk)
 
         segments_iter, info = model.transcribe(
@@ -118,10 +155,10 @@ async def transcribe_file(
         # ✅ Convertimos a lista para poder usarlo varias veces
         seg_list = list(segments_iter)
 
-        # ✅ Texto crudo (igual que tu idea, pero con espacios bien)
+        # ✅ Texto crudo (una sola línea, con espacios bien)
         raw_text = " ".join((seg.text or "").strip() for seg in seg_list).strip()
 
-        # ✅ Segments con timestamps
+        # ✅ Segments con timestamps (para el futuro)
         segments_out = [
             {
                 "id": i,
@@ -133,19 +170,21 @@ async def transcribe_file(
             if (getattr(seg, "text", "") or "").strip()
         ]
 
-        # ✅ Texto “guionizado” básico por párrafos (sin IA extra)
+        # ✅ Texto “guionizado” básico (párrafos)
         paragraph_text = format_paragraphs_from_segments(
             seg_list,
-            max_paragraph_sec=15.0,
-            pause_sec=1.0,
+            max_paragraph_sec=22.0,
+            pause_sec=0.7,
+            min_words=8,
         )
 
         duration = float(getattr(info, "duration", 0) or 0)
 
         return {
             "ok": True,
-            # Mantén text como antes (string). Si prefieres crudo, cambia esta línea a raw_text.
+            # Text = lo que verá el usuario (párrafos). No rompe MVP porque sigue siendo string.
             "text": paragraph_text if paragraph_text else (raw_text if raw_text else "(sin texto)"),
+            # Raw para debug/descarga/comparación
             "rawText": raw_text,
             "durationSec": round(duration),
             "language": language,
