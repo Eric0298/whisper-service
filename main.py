@@ -19,7 +19,7 @@ ALLOWED_MIME = {
 }
 
 # ✅ IMPORTANTE: si sigues justo de RAM en Railway, cambia "base" -> "tiny"
-model = WhisperModel("tiny", device="cpu", compute_type="int8")
+model = WhisperModel("small", device="cpu", compute_type="int8")
 # model = WhisperModel("base", device="cpu", compute_type="int8")
 
 
@@ -148,8 +148,11 @@ async def transcribe_file(
                 tmp.write(chunk)
 
         segments_iter, info = model.transcribe(
-            tmp_path,
-            language=language if language else None,
+             tmp_path,
+    language=language if language else None,
+    vad_filter=True,
+    beam_size=5,
+    best_of=5,
         )
 
         # ✅ Convertimos a lista para poder usarlo varias veces
