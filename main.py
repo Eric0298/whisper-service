@@ -56,6 +56,7 @@ ALLOWED_EXTENSIONS = {
 app = FastAPI(title="whisper-service", version="0.2.0")
 auth_scheme = HTTPBearer(auto_error=False)
 rate_buckets: dict[str, list[float]] = defaultdict(list)
+model: WhisperModel | None = None
 
 allowed_origins = [
     origin.strip()
@@ -72,7 +73,13 @@ if allowed_origins:
         allow_headers=["Authorization", "Content-Type"],
     )
 
-model = WhisperModel(MODEL_NAME, device=MODEL_DEVICE, compute_type=MODEL_COMPUTE_TYPE)
+def get_model():
+    global model
+    if model is None:
+        logger.info("loading whisper model %s", MODEL_NAME)
+        model = WhisperModel(MODEL_NAME, device=MODEL_DEVICE, compute_type=MODEL_COMPUTE_TYPE)
+        logger.info("whisper model loaded")
+    return model
 
 
 @app.get("/", include_in_schema=False)
@@ -86,6 +93,7 @@ def health():
         "ok": True,
         "status": "healthy",
         "model": MODEL_NAME,
+        "modelLoaded": model is not None,
         "maxAudioFileSizeMb": MAX_AUDIO_FILE_SIZE_MB,
         "authEnabled": bool(SERVICE_TOKEN),
     }
@@ -225,7 +233,8 @@ async def transcribe_file(
                     )
                 tmp.write(chunk)
 
-        segments_iter, info = model.transcribe(
+        whisper_model = get_model()
+        segments_iter, info = whisper_model.transcribe(
             tmp_path,
             language=language if language else None,
             vad_filter=True,
