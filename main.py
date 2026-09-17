@@ -11,6 +11,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+import threading
 import time
 
 logger = logging.getLogger("whisper-service")
@@ -331,13 +332,19 @@ async def transcribe_file(
         )
 
         seg_list: list = []
+        stop_event = threading.Event()
 
         def consume_segments():
             try:
                 for seg in segments_iter:
+                    if stop_event.is_set():
+                        break
                     seg_list.append(seg)
-            except GeneratorExit:
-                return
+            finally:
+                try:
+                    segments_iter.close()
+                except Exception:
+                    logger.exception("segments_iter.close() failed")
 
         consume_task = asyncio.create_task(asyncio.to_thread(consume_segments))
 
@@ -349,18 +356,22 @@ async def transcribe_file(
                 pass
 
             if await request.is_disconnected():
-                try:
-                    segments_iter.close()
-                except Exception:
-                    pass
                 logger.info("client disconnected, aborting transcription")
+                stop_event.set()
                 try:
-                    await asyncio.wait_for(consume_task, timeout=10.0)
+                    await asyncio.wait_for(consume_task, timeout=60.0)
                 except asyncio.TimeoutError:
-                    logger.warning("segment consumer still running after cancel signal")
+                    logger.warning("segment consumer still running after stop_event set")
+                else:
+                    exc = consume_task.exception()
+                    if exc is not None:
+                        logger.error("consume_task raised after cancel: %r", exc)
                 raise HTTPException(status_code=499, detail="Cliente desconectado")
 
-        await consume_task
+        exc = consume_task.exception()
+        if exc is not None:
+            logger.error("consume_task raised: %r", exc)
+            raise HTTPException(status_code=500, detail="Error procesando audio")
         raw_text = " ".join((seg.text or "").strip() for seg in seg_list).strip()
         segments_out = [
             {
