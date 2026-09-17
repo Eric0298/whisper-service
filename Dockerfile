@@ -19,6 +19,8 @@ ENV WHISPER_MODEL=${WHISPER_MODEL} \
     WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='${WHISPER_COMPUTE_TYPE}')"
 
+ENV HF_HUB_OFFLINE=1
+
 COPY main.py .
 
 EXPOSE 8000

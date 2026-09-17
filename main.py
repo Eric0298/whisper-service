@@ -3,6 +3,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from faster_whisper import WhisperModel
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 MAX_AUDIO_FILE_SIZE_MB = env_int("MAX_AUDIO_FILE_SIZE_MB", 10, 1, 250)
 MAX_BYTES = MAX_AUDIO_FILE_SIZE_MB * 1024 * 1024
-MAX_AUDIO_DURATION_SEC = env_int("MAX_AUDIO_DURATION_SEC", 600, 10, 7200)
+MAX_AUDIO_DURATION_SEC = env_int("MAX_AUDIO_DURATION_SEC", 180, 10, 7200)
 RATE_LIMIT_PER_MINUTE = env_int("RATE_LIMIT_PER_MINUTE", 30, 1, 600)
 SERVICE_TOKEN = os.getenv("WHISPER_SERVICE_TOKEN", "").strip()
 MODEL_NAME = os.getenv("WHISPER_MODEL", "small").strip() or "small"
@@ -329,7 +330,37 @@ async def transcribe_file(
             best_of=5,
         )
 
-        seg_list = list(segments_iter)
+        seg_list: list = []
+
+        def consume_segments():
+            try:
+                for seg in segments_iter:
+                    seg_list.append(seg)
+            except GeneratorExit:
+                return
+
+        consume_task = asyncio.create_task(asyncio.to_thread(consume_segments))
+
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(consume_task), timeout=0.5)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            if await request.is_disconnected():
+                try:
+                    segments_iter.close()
+                except Exception:
+                    pass
+                logger.info("client disconnected, aborting transcription")
+                try:
+                    await asyncio.wait_for(consume_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("segment consumer still running after cancel signal")
+                raise HTTPException(status_code=499, detail="Cliente desconectado")
+
+        await consume_task
         raw_text = " ".join((seg.text or "").strip() for seg in seg_list).strip()
         segments_out = [
             {
