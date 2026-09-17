@@ -6,7 +6,9 @@ from faster_whisper import WhisperModel
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
+import subprocess
 import tempfile
 import time
 
@@ -23,13 +25,15 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-MAX_AUDIO_FILE_SIZE_MB = env_int("MAX_AUDIO_FILE_SIZE_MB", 25, 1, 250)
+MAX_AUDIO_FILE_SIZE_MB = env_int("MAX_AUDIO_FILE_SIZE_MB", 10, 1, 250)
 MAX_BYTES = MAX_AUDIO_FILE_SIZE_MB * 1024 * 1024
+MAX_AUDIO_DURATION_SEC = env_int("MAX_AUDIO_DURATION_SEC", 600, 10, 7200)
 RATE_LIMIT_PER_MINUTE = env_int("RATE_LIMIT_PER_MINUTE", 30, 1, 600)
 SERVICE_TOKEN = os.getenv("WHISPER_SERVICE_TOKEN", "").strip()
 MODEL_NAME = os.getenv("WHISPER_MODEL", "small").strip() or "small"
 MODEL_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip() or "cpu"
 MODEL_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
+MODEL_CPU_THREADS = env_int("WHISPER_CPU_THREADS", 8, 0, 64)
 
 ALLOWED_MIME = {
     "audio/mpeg",
@@ -76,8 +80,19 @@ if allowed_origins:
 def get_model():
     global model
     if model is None:
-        logger.info("loading whisper model %s", MODEL_NAME)
-        model = WhisperModel(MODEL_NAME, device=MODEL_DEVICE, compute_type=MODEL_COMPUTE_TYPE)
+        logger.info(
+            "loading whisper model %s (device=%s, compute_type=%s, cpu_threads=%d)",
+            MODEL_NAME,
+            MODEL_DEVICE,
+            MODEL_COMPUTE_TYPE,
+            MODEL_CPU_THREADS,
+        )
+        model = WhisperModel(
+            MODEL_NAME,
+            device=MODEL_DEVICE,
+            compute_type=MODEL_COMPUTE_TYPE,
+            cpu_threads=MODEL_CPU_THREADS,
+        )
         logger.info("whisper model loaded")
     return model
 
@@ -132,6 +147,63 @@ def enforce_rate_limit(request: Request):
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if suffix in ALLOWED_EXTENSIONS else ".audio"
+
+
+TIME_RE = re.compile(r"time=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+def probe_audio_duration(path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode == 0:
+        raw = (result.stdout or "").strip()
+        if raw and raw.upper() != "N/A":
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-stats",
+            "-i",
+            path,
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    matches = TIME_RE.findall(result.stderr or "")
+    if matches:
+        h, m, s = matches[-1]
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    raise ValueError("could not determine audio duration")
 
 
 def format_paragraphs_from_segments(
@@ -211,7 +283,11 @@ async def transcribe_file(
     if len(language) > 30 or len(context) > 300:
         raise HTTPException(status_code=400, detail="Parametros invalidos")
 
-    if file.content_type and file.content_type not in ALLOWED_MIME:
+    suffix = Path(file.filename or "").suffix.lower()
+    if file.content_type:
+        if file.content_type not in ALLOWED_MIME:
+            raise HTTPException(status_code=415, detail="Tipo de audio no permitido")
+    elif suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Tipo de audio no permitido")
 
     tmp_path = None
@@ -232,6 +308,17 @@ async def transcribe_file(
                         detail=f"Archivo demasiado grande (max {MAX_AUDIO_FILE_SIZE_MB}MB)",
                     )
                 tmp.write(chunk)
+
+        try:
+            probed_duration = probe_audio_duration(tmp_path)
+        except (ValueError, subprocess.TimeoutExpired):
+            raise HTTPException(status_code=400, detail="Audio no valido")
+
+        if probed_duration > MAX_AUDIO_DURATION_SEC:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio demasiado largo (max {MAX_AUDIO_DURATION_SEC // 60} min)",
+            )
 
         whisper_model = get_model()
         segments_iter, info = whisper_model.transcribe(
